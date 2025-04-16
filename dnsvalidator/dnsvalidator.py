@@ -1,176 +1,219 @@
 #!/usr/bin/env python3
 
 import dns.resolver
-import re
 import sys
 import os
 import signal
 import random
 import string
-import threading
-import time
 import concurrent.futures
 from ipaddress import ip_address, IPv4Address, IPv6Address
-
+from functools import lru_cache
+from typing import List, Dict, Union, Optional, Set, Tuple
 
 from .lib.core.input import InputParser, InputHelper
 from .lib.core.output import OutputHelper, Level
 
 
-def rand():
-    return ''.join(random.choice(string.ascii_lowercase) for i in range(10))
-
-
-def resolve():
-    pass
-
-
-parser = InputParser()
-arguments = parser.parse(sys.argv[1:])
-
-output = OutputHelper(arguments)
-output.print_banner()
-baselines = ["1.1.1.1", "8.8.8.8"]
-
-positivebaselines = ["bet365.com", "telegram.com"]
-nxdomainchecks = ["facebook.com", "paypal.com", "google.com",
-                  "bet365.com", "wikileaks.com"]
-
-goodip = ""
-valid_servers = []
-responses = {}
-
-def validIPAddress(IP):
-    try:
-        ipType = type(ip_address(IP))
-        if ipType is IPv4Address or ipType is IPv6Address:
-                return ipType
-        else:
-                return False
-    except ValueError:
-        return False
-
-def resolve_address(server):
-    # Skip if not IPv4
-    valid = validIPAddress(server)
-    if not valid:
-        output.terminal(Level.VERBOSE, server, "skipping as not valid IP")
-        return
-
-    output.terminal(Level.INFO, server, "Checking...")
-
-    resolver = dns.resolver.Resolver(configure=False)
-    resolver.nameservers = [server]
-
-    # Try to resolve our positive baselines before going any further
-    for nxdomaincheck in nxdomainchecks:
-        # make sure random subdomains are NXDOMAIN
+class DNSValidator:
+    """Main class for validating DNS servers against poisoning and other issues."""
+    
+    def __init__(self, arguments):
+        self.arguments = arguments
+        self.output = OutputHelper(arguments)
+        self.baselines = ["1.1.1.1", "8.8.8.8"]
+        self.positivebaselines = ["bet365.com", "telegram.com"]
+        self.nxdomainchecks = ["facebook.com", "paypal.com", "google.com", 
+                               "bet365.com", "wikileaks.com"]
+        self.valid_servers: List[str] = []
+        self.baseline_responses: Dict[str, Dict] = {}
+        self.rootdomain = arguments.rootdomain
+        self.good_ip: Optional[str] = None
+        
+    @staticmethod
+    def generate_random_subdomain(length: int = 10) -> str:
+        """Generate a random subdomain string."""
+        return ''.join(random.choice(string.ascii_lowercase) for _ in range(length))
+    
+    @staticmethod
+    def is_valid_ip(ip: str) -> Union[type, bool]:
+        """Check if the string is a valid IP address."""
         try:
-            positivehn = "{rand}.{domain}".format(
-                rand=rand(),
-                domain=nxdomaincheck
-            )
-            posanswer = resolver.query(positivehn, 'A')
-
-            # nxdomain exception was not thrown, we got records when we shouldn't have.
-            # Skip the server.
-            output.terminal(Level.ERROR, server,
-                            "DNS poisoning detected, for " + positivehn + " passing")
-            return
-        except dns.resolver.NXDOMAIN:
-            pass
-        except Exception as e:
-            output.terminal(Level.ERROR, server,
-                            "Error when checking for DNS poisoning, passing")
-
-    # Check for nxdomain on the rootdomain we're checking
-    try:
-        nxquery = "{rand}.{rootdomain}".format(
-            rand=rand(),
-            rootdomain=arguments.rootdomain
-        )
-        nxanswer = resolver.query(nxquery, 'A')
-    except dns.resolver.NXDOMAIN:
-        gotnxdomain = True
-    except:
-        output.terminal(Level.ERROR, server,
-                        "Error when checking NXDOMAIN, passing")
-        return
-
-    resolvematches = 0
-    nxdommatches = 0
-
-    for goodresponse in responses:
-        if responses[goodresponse]["goodip"] == goodip:
-            resolvematches += 1
-        if responses[goodresponse]["nxdomain"] == gotnxdomain:
-            nxdommatches += 1
-
-    if resolvematches == 2 and nxdommatches == 2:
-        output.terminal(Level.ACCEPTED, server, "provided valid response")
-        valid_servers.append(server)
-    else:
-        output.terminal(Level.REJECTED, server,
-                        "invalid response received")
-
-
-def main():
-    global goodip
-    # Perform resolution on each of the 'baselines'
-    for baseline in baselines:
-        output.terminal(Level.INFO, baseline, "resolving baseline")
-        baseline_server = {}
-
+            ip_type = type(ip_address(ip))
+            if ip_type in (IPv4Address, IPv6Address):
+                return ip_type
+            return False
+        except ValueError:
+            return False
+    
+    def create_resolver(self, nameserver: str) -> dns.resolver.Resolver:
+        """Create a configured DNS resolver for the given nameserver."""
         resolver = dns.resolver.Resolver(configure=False)
-        resolver.nameservers = [baseline]
-
-        # Check our baseline against this server
+        resolver.nameservers = [nameserver]
+        resolver.timeout = 2.0  # Set a reasonable timeout
+        resolver.lifetime = 4.0  # Total timeout for all queries
+        return resolver
+    
+    @lru_cache(maxsize=128)
+    def resolve_query(self, nameserver: str, query: str, record_type: str = 'A') -> Tuple[bool, Optional[str]]:
+        """Resolve a DNS query and return result with caching for performance."""
+        resolver = self.create_resolver(nameserver)
         try:
-            goodanswer = resolver.query(arguments.rootdomain, 'A')
-        except dns.exception.Timeout:
-            output.terminal(Level.ERROR, baseline,
-                    "DNS Timeout for baseline server. Fatal")
-            sys.exit(1)
-
-        for rr in goodanswer:
-            baseline_server["goodip"] = str(rr)
-            goodip = str(rr)
-
-        # checks for often poisoned domains
-        baseline_server["pos"] = {}
-        for positivebaseline in positivebaselines:
-            posanswer = resolver.query(positivebaseline, 'A')
-            for rr in posanswer:
-                baseline_server["pos"][positivebaseline] = str(rr)
-
-        try:
-            nxdomanswer = resolver.query(
-                arguments.query + arguments.rootdomain, 'A')
-            baseline_server["nxdomain"] = False
+            answer = resolver.query(query, record_type)
+            return True, str(answer[0])
         except dns.resolver.NXDOMAIN:
-            baseline_server["nxdomain"] = True
+            return False, "NXDOMAIN"
         except dns.exception.Timeout:
-            output.terminal(Level.ERROR, baseline,
-                    "DNS Timeout for baseline server. Fatal")
+            return False, "TIMEOUT"
+        except Exception as e:
+            return False, str(e)
+    
+    def check_dns_poisoning(self, server: str) -> bool:
+        """Check if a DNS server shows signs of poisoning."""
+        resolver = self.create_resolver(server)
+        
+        for domain in self.nxdomainchecks:
+            random_subdomain = f"{self.generate_random_subdomain()}.{domain}"
+            try:
+                resolver.query(random_subdomain, 'A')
+                # We got an answer when we should have received NXDOMAIN
+                self.output.terminal(Level.ERROR, server, 
+                                    f"DNS poisoning detected for {random_subdomain}")
+                return True
+            except dns.resolver.NXDOMAIN:
+                # This is expected, continue testing
+                continue
+            except Exception:
+                # Other errors may indicate server issues
+                self.output.terminal(Level.ERROR, server, 
+                                    "Error when checking for DNS poisoning")
+                return True
+        return False
+    
+    def validate_server(self, server: str) -> None:
+        """Validate a DNS server against our criteria."""
+        # Skip if not a valid IP
+        if not self.is_valid_ip(server):
+            self.output.terminal(Level.VERBOSE, server, "skipping as not valid IP")
+            return
+        
+        self.output.terminal(Level.INFO, server, "Checking...")
+        
+        # Check for DNS poisoning first
+        if self.check_dns_poisoning(server):
+            return
+        
+        # Check for correct root domain resolution
+        success, ip = self.resolve_query(server, self.rootdomain)
+        if not success or ip != self.good_ip:
+            self.output.terminal(Level.REJECTED, server, f"Failed to resolve {self.rootdomain} correctly")
+            return
+            
+        # Check for proper NXDOMAIN handling
+        random_subdomain = f"{self.generate_random_subdomain()}.{self.rootdomain}"
+        success, result = self.resolve_query(server, random_subdomain)
+        if success:  # Should have been NXDOMAIN
+            self.output.terminal(Level.REJECTED, server, "Does not properly return NXDOMAIN")
+            return
+            
+        # Server passed all checks
+        self.output.terminal(Level.ACCEPTED, server, "provided valid response")
+        self.valid_servers.append(server)
+    
+    def establish_baseline(self) -> bool:
+        """Establish baseline responses from trusted DNS servers."""
+        for baseline in self.baselines:
+            self.output.terminal(Level.INFO, baseline, "resolving baseline")
+            
+            # Resolve root domain
+            success, ip = self.resolve_query(baseline, self.rootdomain)
+            if not success:
+                self.output.terminal(Level.ERROR, baseline, 
+                                    f"Failed to resolve baseline domain {self.rootdomain}")
+                return False
+                
+            # Set the good IP if not already set
+            if not self.good_ip:
+                self.good_ip = ip
+                
+            # Store baseline data
+            self.baseline_responses[baseline] = {"good_ip": ip}
+            
+            # Check NXDOMAIN responses
+            test_domain = f"{self.generate_random_subdomain()}.{self.rootdomain}"
+            nxsuccess, _ = self.resolve_query(baseline, test_domain)
+            if nxsuccess:
+                self.output.terminal(Level.ERROR, baseline, 
+                                    f"Baseline server failed NXDOMAIN test for {test_domain}")
+                return False
+                
+            # Check positive baselines (domains that should resolve)
+            pos_results = {}
+            for domain in self.positivebaselines:
+                success, result = self.resolve_query(baseline, domain)
+                if not success:
+                    self.output.terminal(Level.ERROR, baseline, 
+                                        f"Failed to resolve positive baseline {domain}")
+                    return False
+                pos_results[domain] = result
+                
+            self.baseline_responses[baseline]["positive_domains"] = pos_results
+            
+        return True
+    
+    def run(self) -> None:
+        """Run the DNS validation process."""
+        self.output.print_banner()
+        
+        # Establish baseline from trusted servers
+        if not self.establish_baseline():
+            self.output.terminal(Level.ERROR, "", "Failed to establish baseline. Exiting.")
             sys.exit(1)
-
-        responses[baseline] = baseline_server
-
-    # loop through the list
-    with concurrent.futures.ThreadPoolExecutor(max_workers=int(arguments.threads)) as executor:
-        thread = {executor.submit(
-            resolve_address, server): server for server in InputHelper.return_targets(arguments)}
-    output.terminal(Level.INFO, 0, "Finished. Discovered {size} servers".format(
-        size=len(valid_servers)))
-
-# Declare signal handler to immediately exit on KeyboardInterrupt
+        
+        # Process target servers in parallel
+        target_servers = InputHelper.return_targets(self.arguments)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=int(self.arguments.threads)) as executor:
+            # Submit all tasks
+            futures = {executor.submit(self.validate_server, server): server for server in target_servers}
+            
+            # Process as they complete
+            for future in concurrent.futures.as_completed(futures):
+                server = futures[future]
+                try:
+                    future.result()  # Get result (or exception)
+                except Exception as exc:
+                    self.output.terminal(Level.ERROR, server, f"Generated an exception: {exc}")
+        
+        self.output.terminal(Level.INFO, "", f"Finished. Discovered {len(self.valid_servers)} valid servers")
+        
+        # Return the list of valid servers for potential use elsewhere
+        return self.valid_servers
 
 
 def signal_handler(signal, frame):
+    """Handle keyboard interrupt gracefully."""
+    print("\nExiting...")
     os._exit(0)
 
 
-signal.signal(signal.SIGINT, signal_handler)
+def main():
+    """Main entry point for the application."""
+    # Register signal handler
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Parse command line arguments
+    parser = InputParser()
+    arguments = parser.parse(sys.argv[1:])
+    
+    # Initialize and run the validator
+    validator = DNSValidator(arguments)
+    valid_servers = validator.run()
+    
+    # Output results to file if specified
+    if arguments.output:
+        with open(arguments.output, 'w') as f:
+            for server in valid_servers:
+                f.write(f"{server}\n")
 
 
 if __name__ == "__main__":
