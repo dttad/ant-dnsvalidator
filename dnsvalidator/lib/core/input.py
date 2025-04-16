@@ -5,179 +5,294 @@ import requests
 from urllib.parse import urlparse
 from argparse import ArgumentParser
 from pathlib import Path
+from typing import Set, List, Optional, Union
+import logging
+from functools import lru_cache
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 
-class InputHelper(object):
+
+class InputHelper:
+    """Helper class for processing input targets and validating arguments."""
+
     @staticmethod
-    def process_targets(parser, arg):
-        if InputHelper.validate_url(arg):
-            targets = InputHelper.process_url(parser, arg)
+    @lru_cache(maxsize=32)
+    def process_targets(parser: ArgumentParser, arg: str) -> List[str]:
+        """
+        Process targets from URL or file.
+        
+        Args:
+            parser: The argument parser for error reporting
+            arg: Target source (URL or filename)
+            
+        Returns:
+            List of target strings
+            
+        Raises:
+            Exception: If no targets are found
+        """
+        targets = []
+        
+        if InputHelper.is_valid_url(arg):
+            targets = InputHelper.fetch_url_content(parser, arg)
         else:
-            filename = InputHelper.validate_filename(parser, arg)
+            filename = InputHelper.validate_filepath(parser, arg)
             if filename:
-                targets = InputHelper.process_file(filename)
+                targets = InputHelper.read_file_lines(filename)
 
-        if len(targets) == 0:
-            raise Exception("No target provided, or empty target list")
-
+        if not targets:
+            parser.error(f"No targets found in {arg}")
+            
         return targets
 
     @staticmethod
-    def validate_url(string):
+    def is_valid_url(url: str) -> bool:
+        """
+        Check if the provided string is a valid URL.
+        
+        Args:
+            url: String to check
+            
+        Returns:
+            True if valid URL, False otherwise
+        """
         try:
-            result = urlparse(string)
-            # if there isn't a scheme, its probably not a URL we can reliably use
-            return result.scheme
-        except:
-            # assume its a file and let the os decide
+            result = urlparse(url)
+            return bool(result.scheme and result.netloc)
+        except Exception:
             return False
 
     @staticmethod
-    def validate_filename(parser, arg):
-        filename_arg = Path(arg)
-        # sometimes we'll encounter ~ and ..
-        filename_resolved = filename_arg.expanduser().resolve()
-        if not filename_resolved.is_file():
-            parser.error("The file %s does not exist or is not a valid URL!" % arg)
-        else:
-            return str(filename_resolved)
-
-    @staticmethod
-    def process_url(parser, arg):
+    def validate_filepath(parser: ArgumentParser, filepath: str) -> Optional[str]:
+        """
+        Validate if the provided path points to an existing file.
+        
+        Args:
+            parser: The argument parser for error reporting
+            filepath: Path to validate
+            
+        Returns:
+            Resolved absolute path as string if valid, None otherwise
+        """
         try:
-            items = requests.get(arg)
-        except:
-            e = sys.exc_info()[0]
-            parser.error(f"Tried to fetch {arg} but got {e} are you sure this is a valid URL?")
-
-        if items.status_code != 200:
-            parser.error(f"Tried to fetch {arg} but got HTTP {items.status_code} {items.reason}.")
-
-        return items.text.split()
-
-    @staticmethod
-    def process_file(arg):
-        with open(arg, 'r') as file:
-            return [line.rstrip('\n') for line in file]
+            path = Path(filepath).expanduser().resolve()
+            if not path.is_file():
+                parser.error(f"The file {filepath} does not exist!")
+                return None
+            return str(path)
+        except Exception as e:
+            parser.error(f"Error validating file {filepath}: {str(e)}")
+            return None
 
     @staticmethod
-    def check_positive(parser, arg):
-        i = int(arg)
-        if i <= 0:
-            raise parser.ArgumentTypeError(
-                "%s is not a valid positive integer!" % arg)
-
-        return arg
+    def fetch_url_content(parser: ArgumentParser, url: str) -> List[str]:
+        """
+        Fetch content from URL with retries and timeouts.
+        
+        Args:
+            parser: The argument parser for error reporting
+            url: URL to fetch content from
+            
+        Returns:
+            List of strings from the URL content
+        """
+        session = requests.Session()
+        
+        # Configure retries for robustness
+        retries = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
+        
+        session.mount('http://', HTTPAdapter(max_retries=retries))
+        session.mount('https://', HTTPAdapter(max_retries=retries))
+        
+        try:
+            response = session.get(url, timeout=(3.05, 10))
+            response.raise_for_status()
+            return [line for line in response.text.split() if line.strip()]
+        except requests.exceptions.RequestException as e:
+            parser.error(f"Failed to fetch content from {url}: {str(e)}")
+            return []
+        finally:
+            session.close()
 
     @staticmethod
-    def return_targets(arguments):
-        targets = set()
-        exclusions = set()
+    def read_file_lines(filepath: str) -> List[str]:
+        """
+        Read lines from file efficiently.
+        
+        Args:
+            filepath: Path to the file
+            
+        Returns:
+            List of non-empty lines
+        """
+        try:
+            with open(filepath, 'r', encoding='utf-8') as file:
+                return [line.strip() for line in file if line.strip()]
+        except Exception as e:
+            logging.error(f"Error reading file {filepath}: {str(e)}")
+            return []
+
+    @staticmethod
+    def check_positive(parser: ArgumentParser, arg: str) -> int:
+        """
+        Validate that argument is a positive integer.
+        
+        Args:
+            parser: The argument parser for error reporting
+            arg: Value to check
+            
+        Returns:
+            Integer value if positive
+            
+        Raises:
+            ArgumentTypeError: If not a positive integer
+        """
+        try:
+            value = int(arg)
+            if value <= 0:
+                parser.error(f"{arg} is not a valid positive integer!")
+            return value
+        except ValueError:
+            parser.error(f"{arg} is not a valid integer!")
+
+    @staticmethod
+    def get_targets(arguments) -> Set[str]:
+        """
+        Process targets and exclusions to return final target set.
+        
+        Args:
+            arguments: Parsed command line arguments
+            
+        Returns:
+            Set of target strings after applying exclusions
+            
+        Raises:
+            Exception: If no targets remain after exclusions
+        """
+        # Use sets for efficient operations
+        targets: Set[str] = set()
+        exclusions: Set[str] = set()
+        
+        # Process targets
         if arguments.target:
             targets.add(arguments.target)
-        else:
-            for item in arguments.target_list:
-                targets.add(item)
-
+        elif arguments.target_list:
+            targets.update(arguments.target_list)
+            
+        # Process exclusions
         if arguments.exclusion:
             exclusions.add(arguments.exclusion)
         elif arguments.exclusions_list:
-            for item in arguments.exclusions_list:
-                exclusions.add(item)
+            exclusions.update(arguments.exclusions_list)
+            
+        # Apply exclusions efficiently
+        final_targets = targets - exclusions
+        
+        if not final_targets:
+            raise ValueError("No targets remain after applying exclusions.")
+            
+        return final_targets
 
-        # difference operation
-        targets -= exclusions
 
-        if len(targets) == 0:
-            raise Exception(
-                "No target remaining after removing all exceptions.")
-        return targets
+class InputParser:
+    """Parser for command line arguments."""
 
-class InputParser(object):
     def __init__(self):
-        self._parser = self.setup_parser()
+        """Initialize the argument parser."""
+        self._parser = self._create_parser()
 
-    def parse(self, argv):
+    def parse(self, argv: List[str]):
+        """
+        Parse command line arguments.
+        
+        Args:
+            argv: List of command line arguments
+            
+        Returns:
+            Parsed arguments object
+        """
         return self._parser.parse_args(argv)
 
-    @staticmethod
-    def setup_parser():
-        parser = ArgumentParser()
-
-        targets = parser.add_mutually_exclusive_group(required=False)
-
-        targets.add_argument(
-            '-t', dest='target', required=False,
-            help='Specify a target DNS server to try resolving.'
+    def _create_parser(self) -> ArgumentParser:
+        """
+        Create and configure the argument parser.
+        
+        Returns:
+            Configured ArgumentParser instance
+        """
+        parser = ArgumentParser(description="DNS Validator - Find valid DNS servers")
+        
+        # Target group
+        target_group = parser.add_mutually_exclusive_group(required=False)
+        target_group.add_argument(
+            '-t', dest='target', 
+            help='Specify a single target DNS server'
         )
-
-        targets.add_argument(
-            '-tL', dest='target_list', required=False,
-            help='Specify a list of target DNS servers to try to resolve. '
-                 'May be a file, or URL to listing',
+        target_group.add_argument(
+            '-tL', dest='target_list',
+            help='Specify a list of target DNS servers (file or URL)',
             default="https://public-dns.info/nameservers.txt",
             type=lambda x: InputHelper.process_targets(parser, x)
         )
 
-        # exclusions group
-        exclusions = parser.add_mutually_exclusive_group()
-
-        exclusions.add_argument(
-            '-e', dest='exclusion', required=False,
-            help='Specify an exclusion to remove from any target lists.'
+        # Exclusions group
+        exclusion_group = parser.add_mutually_exclusive_group()
+        exclusion_group.add_argument(
+            '-e', dest='exclusion',
+            help='Specify a single DNS server to exclude'
         )
-
-        exclusions.add_argument(
-            '-eL', dest='exclusions_list', required=False,
-            help='Specify a list of exclusions to avoid resolving. '
-                 'May be a file or URL to listing',
+        exclusion_group.add_argument(
+            '-eL', dest='exclusions_list',
+            help='Specify a list of DNS servers to exclude (file or URL)',
             type=lambda x: InputHelper.process_targets(parser, x)
         )
 
-        parser.add_argument('-o', '--output',
-                            dest='output',
-                            help='Destination file to write successful DNS validations to.')
-
+        # Output options
         parser.add_argument(
-            '-r', dest='rootdomain', required=False,
-            help="Specify a root domain to compare to (default:",
-            default="bet365.com"
+            '-o', '--output', dest='output',
+            help='File to write valid DNS servers to'
         )
 
+        # DNS validation options
         parser.add_argument(
-            '-q', dest='query', required=False,
-            help="Specify a resolver query to use (default:dnsvalidator)",
-            default="dnsvalidator"
+            '-r', dest='rootdomain', default="bet365.com",
+            help='Root domain for DNS validation (default: bet365.com)'
+        )
+        parser.add_argument(
+            '-q', dest='query', default="dnsvalidator",
+            help='Query string for resolution tests (default: dnsvalidator)'
         )
 
+        # Performance options
         parser.add_argument(
-            '-threads', dest='threads', required=False,
-            help="Specify the maximum number of threads to run (DEFAULT:5)",
-            default=5,
-            type=lambda x: InputHelper.check_positive(parser, x)
+            '-threads', dest='threads', default=5,
+            type=lambda x: InputHelper.check_positive(parser, x),
+            help='Maximum number of concurrent threads (default: 5)'
+        )
+        parser.add_argument(
+            '-timeout', dest='timeout', default=600,
+            type=lambda x: InputHelper.check_positive(parser, x),
+            help='Operation timeout in seconds (default: 600)'
         )
 
-        parser.add_argument(
-            '-timeout', dest='timeout', required=False,
-            help="Command timeout in seconds (DEFAULT:600)",
-            default=600,
-            type=lambda x: InputHelper.check_positive(parser, x)
-        )
-
+        # Display options
         parser.add_argument(
             '--no-color', dest='nocolor', action='store_true', default=False,
-            help='If set then any foreground or background colours will be '
-                 'stripped out.'
+            help='Disable colored output'
         )
-
-        output_types = parser.add_mutually_exclusive_group()
-        output_types.add_argument(
+        
+        output_group = parser.add_mutually_exclusive_group()
+        output_group.add_argument(
             '-v', '--verbose', dest='verbose', action='store_true', default=False,
-            help='If set then verbose output will be displayed in the terminal.'
+            help='Enable verbose output'
         )
-        output_types.add_argument(
+        output_group.add_argument(
             '--silent', dest='silent', action='store_true', default=False,
-            help='If set only findings will be displayed and banners '
-                 'and other information will be redacted.'
+            help='Suppress all non-essential output'
         )
 
         return parser
