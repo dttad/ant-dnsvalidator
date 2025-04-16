@@ -1,0 +1,1 @@
+docker run -v $(pwd):/dnsvalidator/output -t dnsvalidator -tL https://public-dns.info/nameservers.txt -threads 10 -o /dnsvalidator/output/resolvers.txt
