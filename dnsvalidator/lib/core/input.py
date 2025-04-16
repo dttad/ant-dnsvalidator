@@ -14,6 +14,20 @@ from requests.packages.urllib3.util.retry import Retry
 
 class InputHelper:
     """Helper class for processing input targets and validating arguments."""
+    
+    @staticmethod
+    def return_targets(arguments):
+        """
+        Backward compatibility method for older code.
+        
+        Args:
+            arguments: Parsed command line arguments
+            
+        Returns:
+            Set of targets after applying exclusions
+        """
+        # Simply call the new method
+        return InputHelper.get_targets(arguments)
 
     @staticmethod
     @lru_cache(maxsize=32)
